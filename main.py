@@ -1,122 +1,128 @@
-# main.py
-
 import os
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
-from langchain.chat_models import ChatAnthropic
-from langchain.agents import initialize_agent, Tool, AgentType
-from langchain.memory import ConversationBufferMemory
-from langchain.utilities import SerpAPIWrapper
-from llama_index import (
-    VectorStoreIndex,
-    LLMPredictor,
-    ServiceContext,
-    PromptHelper,
-    Document,
-    SimpleNodeParser,
-)
-from llama_index.vector_stores.lancedb import LanceDBVectorStore
-import lancedb
 import json
+import faiss
+import pickle
+from langchain.chat_models import ChatOpenAI
+from langchain.agents import Tool, AgentExecutor, AgentType, ZeroShotAgent
+from langchain.vectorstores import FAISS
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.chains import RetrievalQA
+from langchain.text_splitter import CharacterTextSplitter
+from langchain.schema import Document
+from langchain.prompts import PromptTemplate
+from langchain import LLMChain
+from dotenv import load_dotenv
 
-# Set up API keys
-os.environ["ANTHROPIC_API_KEY"] = 'your-anthropic-api-key'
-os.environ["SERPAPI_API_KEY"] = 'your-serpapi-api-key'
+load_dotenv()
 
-# Load JSON data
-with open('dataset_website-content-crawler_2024-06-24_17-30-57-747.json', 'r', encoding='utf-8') as f:
-    json_data = json.load(f)
+# Ensure the OpenAI API key is set
+os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
 
-# Extract documents
-documents = []
-for item in json_data['documents']:
-    text = item['text']
-    doc = Document(text=text)
-    documents.append(doc)
+# File paths for FAISS index and docstore metadata
+FAISS_INDEX_PATH = "faiss_index.bin"
+DOCSTORE_PATH = "docstore.pkl"
+DATA_FILE_PATH = "data.json"  # Replace with your actual file path
 
-# Initialize the parser
-parser = SimpleNodeParser()
-
-# Parse documents into nodes (chunks)
-nodes = parser.get_nodes_from_documents(documents)
-
-# Initialize LanceDB
-db = lancedb.connect("./lancedb")
-try:
-    table = db.create_table("documents")
-except:
-    table = db.open_table("documents")
-
-# Initialize vector store
-vector_store = LanceDBVectorStore(
-    table=table,
-    dimension=1536,  # Adjust based on your embedding model
-)
-
-# Initialize the chat model
-chat_model = ChatAnthropic(
-    model="claude-3-5-sonnet-20260620",
+# Initialize the chat model with OpenAI's GPT
+chat_model = ChatOpenAI(
+    model="gpt-4o-mini",  # Change to "gpt-4" if you have access
     temperature=0.7,
-    max_tokens_to_sample=1000,
+    max_tokens=1500,  # Increased to allow longer responses
 )
 
-# Set up LLMPredictor and PromptHelper
-llm_predictor = LLMPredictor(llm=chat_model)
+# Initialize OpenAI embeddings
+embeddings = OpenAIEmbeddings()
 
-prompt_helper = PromptHelper(
-    max_input_size=4096,
-    num_output=1000,
-    max_chunk_overlap=20,
-    chunk_size_limit=600,
-)
+# Check if FAISS index file and docstore exist
+if os.path.exists(FAISS_INDEX_PATH) and os.path.exists(DOCSTORE_PATH):
+    # Load the FAISS index from file
+    print("Loading FAISS index from file...")
+    index = faiss.read_index(FAISS_INDEX_PATH)
 
-# Create service context
-service_context = ServiceContext.from_defaults(
-    llm_predictor=llm_predictor,
-    prompt_helper=prompt_helper,
-)
+    # Load the docstore and index_to_docstore_id mappings
+    with open(DOCSTORE_PATH, "rb") as f:
+        docstore, index_to_docstore_id = pickle.load(f)
 
-# Build the index with chunked nodes
-index = VectorStoreIndex(
-    nodes,
-    service_context=service_context,
-    vector_store=vector_store,
-)
+    # Initialize FAISS vector store with loaded components
+    vectorstore = FAISS(
+        embedding_function=embeddings.embed_query,
+        index=index,
+        docstore=docstore,
+        index_to_docstore_id=index_to_docstore_id
+    )
+else:
+    # Load documents from a JSON file
+    with open(DATA_FILE_PATH, 'r', encoding='utf-8') as f:
+        json_data = json.load(f)
+        documents = [
+            Document(page_content=item["text"]) for item in json_data
+            if "text" in item and item["text"] is not None
+        ]
 
-# Define tools
-def retrieve_documents(query):
-    response = index.as_query_engine().query(query)
-    return str(response)
+    # Split the documents into chunks
+    text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    docs = text_splitter.split_documents(documents)
 
-document_tool = Tool(
-    name="Document Retrieval",
-    func=retrieve_documents,
-    description="Use this tool to search for information in the document database.",
-)
+    # Initialize FAISS vector store and populate with documents
+    print("Creating new FAISS index...")
+    vectorstore = FAISS.from_documents(docs, embeddings)
 
-search = SerpAPIWrapper()
+    # Save the FAISS index to disk
+    faiss.write_index(vectorstore.index, FAISS_INDEX_PATH)
 
-search_tool = Tool(
-    name="Web Search",
-    func=search.run,
-    description="Use this tool to search the web for up-to-date information.",
-)
+    # Save the docstore and index_to_docstore_id mappings
+    with open(DOCSTORE_PATH, "wb") as f:
+        pickle.dump((vectorstore.docstore, vectorstore.index_to_docstore_id), f)
 
-tools = [document_tool, search_tool]
+    print("FAISS index and metadata saved to disk.")
 
-# Set up conversation memory
-memory = ConversationBufferMemory(
-    memory_key="chat_history",
-    return_messages=True,
-)
+# Set up a retrieval chain for document Q&A
+retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 2})
 
-# Initialize the agent
-agent = initialize_agent(
-    tools=tools,
+# Using a RetrievalQA chain
+qa_chain = RetrievalQA.from_chain_type(
     llm=chat_model,
-    agent=AgentType.CHAT_CONVERSATIONAL_REACT_DESCRIPTION,
+    chain_type="stuff",  # Basic QA chain type
+    retriever=retriever
+)
+
+# Define any additional tools
+tools = [
+    Tool(
+        name="Document QA",
+        func=qa_chain.run,
+        description="Use this tool to answer questions based on the documents."
+    )
+]
+
+# Create a custom prompt to encourage more detailed responses
+custom_prompt = ZeroShotAgent.create_prompt(
+    tools,
+    prefix="""You are a highly knowledgeable assistant. When providing answers please make them concise and clear.""",
+    suffix="""Answer the following question:
+
+{input}
+
+{agent_scratchpad}""",
+    input_variables=["input", "agent_scratchpad"]
+)
+
+# Initialize the LLMChain with the custom prompt
+llm_chain = LLMChain(llm=chat_model, prompt=custom_prompt)
+
+# Create the agent with the LLMChain and tools
+agent = ZeroShotAgent(llm_chain=llm_chain, tools=tools, verbose=True)
+
+# Create an AgentExecutor
+agent_executor = AgentExecutor.from_agent_and_tools(
+    agent=agent,
+    tools=tools,
     verbose=True,
-    memory=memory,
+    handle_parsing_errors=True
+    # max_iterations=5
 )
 
 # Set up FastAPI app
@@ -130,12 +136,17 @@ async def chat_endpoint(request: Request):
     if not query:
         return {"error": "Please provide a query."}
 
-    if query.lower() == "reset_memory":
-        memory.clear()
-        return {"response": "Memory has been reset."}
-    else:
-        response = agent.run(query)
-        return {"response": response}
+    response = await agent_executor.arun(query)  # Use 'arun' for async execution
+    return {"response": response}
 
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Run the server
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000)

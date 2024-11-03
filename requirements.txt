@@ -1,0 +1,8 @@
+fastapi[standard]
+uvicorn
+faiss-cpu
+langchain
+langchain_community
+openai
+tiktoken
+python-dotenv
