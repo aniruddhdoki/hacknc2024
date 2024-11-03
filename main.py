@@ -24,7 +24,7 @@ os.environ["ANTHROPIC_API_KEY"] = 'your-anthropic-api-key'
 os.environ["SERPAPI_API_KEY"] = 'your-serpapi-api-key'
 
 # Load JSON data
-with open('v1 dataset.json', 'r', encoding='utf-8') as f:
+with open('dataset_website-content-crawler_2024-06-24_17-30-57-747.json', 'r', encoding='utf-8') as f:
     json_data = json.load(f)
 
 # Extract documents
